@@ -1,0 +1,298 @@
+#Requires -Version 5.1
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms
+
+# --------------------- CONFIG ---------------------
+$UseUnicodeArrows = $true
+$Opacity          = 0.90
+$FontSize         = 24
+$KeyColor         = "Lime"
+$MouseMoveColor   = "Cyan"
+$MouseClickColor  = "Yellow"
+$BgAlpha          = 0x10
+$GripHeight       = 18
+$GripColor        = "#40FFFFFF"
+$PositionX        = 20
+$PositionY        = 20
+$DisplayTime      = 0.8
+$PollIntervalMs   = 30
+# --------------------------------------------------
+
+$Window = New-Object Windows.Window
+$Window.WindowStyle         = 'None'
+$Window.AllowsTransparency  = $true
+$Window.Background          = 'Transparent'
+$Window.Topmost             = $true
+$Window.ShowInTaskbar       = $false
+$Window.SizeToContent       = 'WidthAndHeight'
+$Window.Left                = $PositionX
+$Window.Top                 = $PositionY
+$Window.Opacity             = $Opacity
+
+$MainStack = New-Object Windows.Controls.StackPanel
+$MainStack.Orientation = 'Vertical'
+$MainStack.Background  = 'Transparent'
+
+$Grip = New-Object Windows.Controls.Border
+$Grip.Height           = $GripHeight
+$Grip.Background       = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromArgb(0x40, 255, 255, 255))
+$Grip.BorderThickness  = '0'
+$Grip.CornerRadius     = New-Object Windows.CornerRadius 4,4,0,0
+$Grip.Cursor           = 'SizeAll'
+
+$Grip.Add_MouseLeftButtonDown({
+    if ($_.ButtonState -eq 'Pressed') { $Window.DragMove() }
+})
+
+$MainStack.Children.Add($Grip)
+
+$ContentGrid = New-Object Windows.Controls.Grid
+$ContentGrid.Background = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromArgb($BgAlpha, 0, 0, 0))
+$ContentGrid.IsHitTestVisible = $false
+
+$ContentStack = New-Object Windows.Controls.StackPanel
+$ContentStack.Orientation = 'Vertical'
+$ContentStack.IsHitTestVisible = $false
+
+$KeyText = New-Object Windows.Controls.TextBlock
+$KeyText.FontSize      = $FontSize
+$KeyText.Foreground    = [Windows.Media.Brushes]::$KeyColor
+$KeyText.Margin        = '6,2,6,1'
+$KeyText.TextAlignment = 'Center'
+$KeyText.FontFamily    = 'Consolas'
+$KeyText.MinWidth      = 100
+$ContentStack.Children.Add($KeyText)
+
+$MouseText = New-Object Windows.Controls.TextBlock
+$MouseText.FontSize      = $FontSize - 2
+$MouseText.Foreground    = [Windows.Media.Brushes]::$MouseMoveColor
+$MouseText.Margin        = '6,1,6,2'
+$MouseText.TextAlignment = 'Center'
+$MouseText.FontFamily    = 'Consolas'
+$MouseText.MinWidth      = 100
+$ContentStack.Children.Add($MouseText)
+
+$ContentGrid.Children.Add($ContentStack)
+$MainStack.Children.Add($ContentGrid)
+
+$Window.Content = $MainStack
+
+$mouseClearTimer = New-Object System.Windows.Threading.DispatcherTimer
+$mouseClearTimer.Interval = [TimeSpan]::FromSeconds($DisplayTime)
+$mouseClearTimer.Add_Tick({ $MouseText.Text = ""; $mouseClearTimer.Stop() })
+
+# ────────────────────────────────────────────────
+#   Keyboard hook – fixed: no ?. operator
+# ────────────────────────────────────────────────
+Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+public class AdvancedKeyHook : IDisposable
+{
+    private const int WH_KEYBOARD_LL = 13;
+    private const int WM_KEYDOWN     = 0x0100;
+    private const int WM_KEYUP       = 0x0101;
+    private const int WM_SYSKEYDOWN  = 0x0104;
+    private const int WM_SYSKEYUP    = 0x0105;
+
+    private LowLevelKeyboardProc _proc;
+    private IntPtr _hookID = IntPtr.Zero;
+
+    public event Action<string, bool> KeyStateChanged;
+
+    public AdvancedKeyHook()
+    {
+        _proc = HookCallback;
+        _hookID = SetHook(_proc);
+    }
+
+    public void Dispose()
+    {
+        UnhookWindowsHookEx(_hookID);
+    }
+
+    private IntPtr SetHook(LowLevelKeyboardProc proc)
+    {
+        using (Process curProcess = Process.GetCurrentProcess())
+        using (ProcessModule curModule = curProcess.MainModule)
+        {
+            return SetWindowsHookEx(WH_KEYBOARD_LL, proc,
+                GetModuleHandle(curModule.ModuleName), 0);
+        }
+    }
+
+    private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+    private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0)
+        {
+            int vkCode = Marshal.ReadInt32(lParam);
+            Keys key = (Keys)vkCode;
+            string keyName = GetFriendlyName(key);
+
+            bool isDown = (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)WM_SYSKEYDOWN);
+
+            if (isDown || wParam == (IntPtr)WM_KEYUP || wParam == (IntPtr)WM_SYSKEYUP)
+            {
+                // FIXED: no null-conditional
+                if (KeyStateChanged != null) KeyStateChanged.Invoke(keyName, isDown);
+            }
+        }
+        return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+    }
+
+    private string GetFriendlyName(Keys key)
+    {
+        switch (key)
+        {
+            case Keys.Space: return "Space";
+            case Keys.Enter: return "Enter";
+            case Keys.Back:  return "Back";
+            case Keys.Tab:   return "Tab";
+            case Keys.LShiftKey: case Keys.RShiftKey: return "Shift";
+            case Keys.LControlKey: case Keys.RControlKey: return "Ctrl";
+            case Keys.LMenu: case Keys.RMenu: return "Alt";
+            case Keys.LWin: case Keys.RWin: return "Win";
+            default: return key.ToString();
+        }
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern IntPtr GetModuleHandle(string lpModuleName);
+}
+'@ -ErrorAction Stop
+
+$heldKeys = New-Object 'System.Collections.Generic.HashSet[string]'
+
+function Update-KeyDisplay {
+    if ($heldKeys.Count -eq 0) {
+        $KeyText.Text = ""
+    } else {
+        $sorted = $heldKeys | Sort-Object { 
+            if ($_ -in @("Shift","Ctrl","Alt","Win")) { 0 } else { 1 }
+        }, { $_ }
+        $KeyText.Text = ($sorted -join " + ")
+    }
+}
+
+$mousePollTimer = New-Object System.Windows.Threading.DispatcherTimer
+$mousePollTimer.Interval = [TimeSpan]::FromMilliseconds($PollIntervalMs)
+
+$lastPos    = [System.Windows.Forms.Cursor]::Position
+$lastButtons = [System.Windows.Forms.MouseButtons]::None
+
+$arrowMap = @{
+    0                = "→"
+    ([Math]::PI/4)   = "↗"
+    ([Math]::PI/2)   = "↑"
+    (3*[Math]::PI/4) = "↖"
+    [Math]::PI       = "←"
+    (-3*[Math]::PI/4)= "↙"
+    (-[Math]::PI/2)  = "↓"
+    (-[Math]::PI/4)  = "↘"
+}
+
+$textMap = @{
+    0                = "Right"
+    ([Math]::PI/4)   = "Up-Right"
+    ([Math]::PI/2)   = "Up"
+    (3*[Math]::PI/4) = "Up-Left"
+    [Math]::PI       = "Left"
+    (-3*[Math]::PI/4)= "Down-Left"
+    (-[Math]::PI/2)  = "Down"
+    (-[Math]::PI/4)  = "Down-Right"
+}
+
+function Get-Direction($dx, $dy) {
+    if ([Math]::Abs($dx) -lt 5 -and [Math]::Abs($dy) -lt 5) { return $null }
+    $angle = [Math]::Atan2(-$dy, $dx)
+    $angle = ($angle + 2*[Math]::PI) % (2*[Math]::PI)
+    $bestDiff = [double]::MaxValue
+    $bestKey = 0
+    foreach ($key in $arrowMap.Keys) {
+        $diff = [Math]::Min([Math]::Abs($angle - $key), [Math]::Abs($angle - $key - 2*[Math]::PI))
+        if ($diff -lt $bestDiff) { $bestDiff = $diff; $bestKey = $key }
+    }
+    if ($bestDiff -gt [Math]::PI/6) { return $null }
+    if ($UseUnicodeArrows) { return $arrowMap[$bestKey] }
+    else                   { return $textMap[$bestKey] }
+}
+
+$mousePollTimer.Add_Tick({
+    $pos    = [System.Windows.Forms.Cursor]::Position
+    $buttons = [System.Windows.Forms.Control]::MouseButtons
+
+    $dx = $pos.X - $lastPos.X
+    $dy = $pos.Y - $lastPos.Y
+
+    $dir = Get-Direction $dx $dy
+
+    $parts = @()
+    if ($dir) { $parts += $dir }
+
+    if ($buttons -ne $lastButtons) {
+        if ($buttons -band [System.Windows.Forms.MouseButtons]::Left)   { $parts += "LMB" }
+        if ($buttons -band [System.Windows.Forms.MouseButtons]::Right)  { $parts += "RMB" }
+        if ($buttons -band [System.Windows.Forms.MouseButtons]::Middle) { $parts += "MMB" }
+    }
+
+    if ($parts.Count -gt 0) {
+        $symbol = $parts -join " "
+        $Window.Dispatcher.Invoke([action]{
+            if ($dir) {
+                $MouseText.Foreground = [Windows.Media.Brushes]::$MouseMoveColor
+            } else {
+                $MouseText.Foreground = [Windows.Media.Brushes]::$MouseClickColor
+            }
+            $MouseText.Text = $symbol
+            $mouseClearTimer.Start()
+        })
+    }
+
+    $lastPos    = $pos
+    $lastButtons = $buttons
+})
+
+$hook = New-Object AdvancedKeyHook
+
+$hook.add_KeyStateChanged({
+    param($keyName, $isDown)
+    $Window.Dispatcher.Invoke([action]{
+        if ($isDown) {
+            [void]$heldKeys.Add($keyName)
+        } else {
+            [void]$heldKeys.Remove($keyName)
+        }
+        Update-KeyDisplay
+    })
+})
+
+$Window.Show()
+$mousePollTimer.Start()
+
+Write-Host "Drag top bar. Ctrl+C to exit."
+
+try {
+    [System.Windows.Threading.Dispatcher]::Run()
+}
+finally {
+    $hook.Dispose()
+    $mousePollTimer.Stop()
+    $mouseClearTimer.Stop()
+    $Window.Close()
+}aswdsawdsawdsawdsadadada
+asd
