@@ -1,12 +1,34 @@
-Add-Type -AssemblyName System.Windows.Forms
+#Requires -Version 5.1
+# Combined Monitor Script - Drive Monitor + Window Title + Key/Mouse Hook
+# Save as CombinedMonitor.ps1 and run with: powershell -ExecutionPolicy Bypass -File CombinedMonitor.ps1
+
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# Win32 API functions
+# --------------------- CONFIG ---------------------
+$UseUnicodeArrows = $true
+$Opacity          = 0.92
+$FontSize         = 14
+$KeyColor         = "Lime"
+$MouseMoveColor   = "Cyan"
+$MouseClickColor  = "Yellow"
+$DriveColor       = "Orange"
+$WindowColor      = "White"
+$BgAlpha          = 200
+$GripHeight       = 16
+$PositionX        = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea.Right - 320
+$PositionY        = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea.Bottom - 260
+$DisplayTime      = 0.15
+$PollIntervalMs   = 16
+$DriveCheckMs     = 3000
+# --------------------------------------------------
+
+# Win32 API for foreground window
 $signature = @"
 using System;
 using System.Runtime.InteropServices;
 
-public class Win32 {
+public class Win32Monitor {
     [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
 
@@ -17,71 +39,488 @@ public class Win32 {
     public static extern int GetWindowTextLength(IntPtr hWnd);
 }
 "@
-
-Add-Type -TypeDefinition $signature
+Add-Type -TypeDefinition $signature -ErrorAction SilentlyContinue
 
 function Get-ForegroundWindowTitle {
-    $hwnd = [Win32]::GetForegroundWindow()
+    $hwnd = [Win32Monitor]::GetForegroundWindow()
     if ($hwnd -eq [IntPtr]::Zero) { return "" }
-
-    $length = [Win32]::GetWindowTextLength($hwnd)
+    $length = [Win32Monitor]::GetWindowTextLength($hwnd)
     if ($length -le 0) { return "" }
-
     $builder = New-Object System.Text.StringBuilder ($length + 1)
-    [Win32]::GetWindowText($hwnd, $builder, $builder.Capacity) | Out-Null
+    [Win32Monitor]::GetWindowText($hwnd, $builder, $builder.Capacity) | Out-Null
     return $builder.ToString()
 }
 
-# Create overlay form
-$form = New-Object System.Windows.Forms.Form
-$form.FormBorderStyle = 'None'
-$form.StartPosition = 'Manual'
-$form.Location = New-Object System.Drawing.Point(0, 0)
-$form.Size = New-Object System.Drawing.Size(260, 120)
-$form.TopMost = $true
-$form.ShowInTaskbar = $false
-$form.BackColor = [System.Drawing.Color]::Black
-$form.TransparencyKey = [System.Drawing.Color]::Black
+# ─────────────────────────────────────────────────────────────
+#   Main WPF Window
+# ─────────────────────────────────────────────────────────────
+$Window = New-Object Windows.Window
+$Window.WindowStyle         = 'None'
+$Window.AllowsTransparency  = $true
+$Window.Background          = 'Transparent'
+$Window.Topmost             = $true
+$Window.ShowInTaskbar       = $false
+$Window.ResizeMode          = 'CanResizeWithGrip'
+$Window.Width               = 300
+$Window.Height              = 240
+$Window.MinWidth            = 200
+$Window.MinHeight           = 150
+$Window.Left                = $PositionX
+$Window.Top                 = $PositionY
+$Window.Opacity             = $Opacity
 
-# Label (green text)
-$label = New-Object System.Windows.Forms.Label
-$label.ForeColor = [System.Drawing.Color]::Lime
-$label.Font = New-Object System.Drawing.Font("Consolas", 9, [System.Drawing.FontStyle]::Bold)
-$label.AutoSize = $true
-$label.Location = New-Object System.Drawing.Point(8, 8)
-$label.Text = "Waiting..."
-$form.Controls.Add($label)
+# Main container
+$MainBorder = New-Object Windows.Controls.Border
+$MainBorder.Background      = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromArgb($BgAlpha, 20, 20, 25))
+$MainBorder.CornerRadius    = New-Object Windows.CornerRadius 8
+$MainBorder.BorderBrush     = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromArgb(80, 100, 100, 100))
+$MainBorder.BorderThickness = 1
 
-# Draw triangle
-$form.Add_Paint({
-    $g = $_.Graphics
-    $p1 = New-Object System.Drawing.Point(0, 0)
-    $p2 = New-Object System.Drawing.Point(260, 0)
-    $p3 = New-Object System.Drawing.Point(0, 120)
+$MainStack = New-Object Windows.Controls.StackPanel
+$MainStack.Orientation = 'Vertical'
 
-    $points = New-Object System.Drawing.Point[] 3
-    $points[0] = $p1
-    $points[1] = $p2
-    $points[2] = $p3
+# ─────────────────────────────────────────────────────────────
+#   Title Bar (Draggable)
+# ─────────────────────────────────────────────────────────────
+$TitleBar = New-Object Windows.Controls.Border
+$TitleBar.Height           = $GripHeight
+$TitleBar.Background       = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromArgb(60, 255, 255, 255))
+$TitleBar.CornerRadius     = New-Object Windows.CornerRadius 8,8,0,0
+$TitleBar.Cursor           = 'SizeAll'
 
-    $brush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(160, 0, 0, 0))
-    $g.FillPolygon($brush, [System.Drawing.Point[]]$points)
+$TitleText = New-Object Windows.Controls.TextBlock
+$TitleText.Text            = "  MONITOR SUITE"
+$TitleText.FontSize        = 9
+$TitleText.FontFamily      = 'Consolas'
+$TitleText.Foreground      = [Windows.Media.Brushes]::Gray
+$TitleText.VerticalAlignment = 'Center'
+$TitleBar.Child = $TitleText
+
+$TitleBar.Add_MouseLeftButtonDown({
+    if ($_.ButtonState -eq 'Pressed') { $Window.DragMove() }
 })
 
-# Update label instantly when active window changes
-$lastTitle = ""
+$MainStack.Children.Add($TitleBar)
 
-$timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = 50  # fast update
-$timer.Add_Tick({
+# ─────────────────────────────────────────────────────────────
+#   Section 1: Key/Mouse Display
+# ─────────────────────────────────────────────────────────────
+$KeySection = New-Object Windows.Controls.Border
+$KeySection.Margin = '6,4,6,2'
+$KeySection.Padding = '4'
+$KeySection.Background = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromArgb(40, 0, 0, 0))
+$KeySection.CornerRadius = New-Object Windows.CornerRadius 4
+
+$KeyStack = New-Object Windows.Controls.StackPanel
+$KeyStack.Orientation = 'Vertical'
+
+$KeyLabel = New-Object Windows.Controls.TextBlock
+$KeyLabel.Text = "KEYS / MOUSE"
+$KeyLabel.FontSize = 8
+$KeyLabel.FontFamily = 'Consolas'
+$KeyLabel.Foreground = [Windows.Media.Brushes]::Gray
+$KeyLabel.Margin = '0,0,0,2'
+$KeyStack.Children.Add($KeyLabel)
+
+$KeyText = New-Object Windows.Controls.TextBlock
+$KeyText.FontSize      = $FontSize
+$KeyText.Foreground    = [Windows.Media.Brushes]::$KeyColor
+$KeyText.FontFamily    = 'Consolas'
+$KeyText.TextWrapping  = 'Wrap'
+$KeyText.MinHeight     = 20
+$KeyStack.Children.Add($KeyText)
+
+# Mouse buttons display (separate from direction)
+$MouseButtonText = New-Object Windows.Controls.TextBlock
+$MouseButtonText.FontSize      = $FontSize - 2
+$MouseButtonText.Foreground    = [Windows.Media.Brushes]::$MouseClickColor
+$MouseButtonText.FontFamily    = 'Consolas'
+$MouseButtonText.MinHeight     = 18
+$KeyStack.Children.Add($MouseButtonText)
+
+# Mouse direction display (separate from buttons)
+$MouseDirText = New-Object Windows.Controls.TextBlock
+$MouseDirText.FontSize      = $FontSize - 2
+$MouseDirText.Foreground    = [Windows.Media.Brushes]::$MouseMoveColor
+$MouseDirText.FontFamily    = 'Consolas'
+$MouseDirText.MinHeight     = 18
+$KeyStack.Children.Add($MouseDirText)
+
+$KeySection.Child = $KeyStack
+$MainStack.Children.Add($KeySection)
+
+# ─────────────────────────────────────────────────────────────
+#   Section 2: Active Window Display
+# ─────────────────────────────────────────────────────────────
+$WinSection = New-Object Windows.Controls.Border
+$WinSection.Margin = '6,2,6,2'
+$WinSection.Padding = '4'
+$WinSection.Background = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromArgb(40, 0, 0, 0))
+$WinSection.CornerRadius = New-Object Windows.CornerRadius 4
+
+$WinStack = New-Object Windows.Controls.StackPanel
+$WinStack.Orientation = 'Vertical'
+
+$WinLabel = New-Object Windows.Controls.TextBlock
+$WinLabel.Text = "ACTIVE WINDOW"
+$WinLabel.FontSize = 8
+$WinLabel.FontFamily = 'Consolas'
+$WinLabel.Foreground = [Windows.Media.Brushes]::Gray
+$WinLabel.Margin = '0,0,0,2'
+$WinStack.Children.Add($WinLabel)
+
+$WindowTitleText = New-Object Windows.Controls.TextBlock
+$WindowTitleText.FontSize      = 10
+$WindowTitleText.Foreground    = [Windows.Media.Brushes]::$WindowColor
+$WindowTitleText.FontFamily    = 'Consolas'
+$WindowTitleText.TextTrimming  = 'CharacterEllipsis'
+$WindowTitleText.Text          = "Waiting..."
+$WinStack.Children.Add($WindowTitleText)
+
+$WinSection.Child = $WinStack
+$MainStack.Children.Add($WinSection)
+
+# ─────────────────────────────────────────────────────────────
+#   Section 3: Drive Monitor
+# ─────────────────────────────────────────────────────────────
+$DriveSection = New-Object Windows.Controls.Border
+$DriveSection.Margin = '6,2,6,4'
+$DriveSection.Padding = '4'
+$DriveSection.Background = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromArgb(40, 0, 0, 0))
+$DriveSection.CornerRadius = New-Object Windows.CornerRadius 4
+
+$DriveStack = New-Object Windows.Controls.StackPanel
+$DriveStack.Orientation = 'Vertical'
+
+$DriveLabel = New-Object Windows.Controls.TextBlock
+$DriveLabel.Text = "DRIVES (3s refresh)"
+$DriveLabel.FontSize = 8
+$DriveLabel.FontFamily = 'Consolas'
+$DriveLabel.Foreground = [Windows.Media.Brushes]::Gray
+$DriveLabel.Margin = '0,0,0,2'
+$DriveStack.Children.Add($DriveLabel)
+
+$DriveScroll = New-Object Windows.Controls.ScrollViewer
+$DriveScroll.VerticalScrollBarVisibility = 'Auto'
+$DriveScroll.MaxHeight = 70
+
+$DriveLogText = New-Object Windows.Controls.TextBlock
+$DriveLogText.FontSize      = 9
+$DriveLogText.Foreground    = [Windows.Media.Brushes]::$DriveColor
+$DriveLogText.FontFamily    = 'Consolas'
+$DriveLogText.TextWrapping  = 'Wrap'
+$DriveScroll.Content = $DriveLogText
+
+$DriveStack.Children.Add($DriveScroll)
+$DriveSection.Child = $DriveStack
+$MainStack.Children.Add($DriveSection)
+
+$MainBorder.Child = $MainStack
+$Window.Content = $MainBorder
+
+# ─────────────────────────────────────────────────────────────
+#   Keyboard Hook
+# ─────────────────────────────────────────────────────────────
+Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+public class AdvancedKeyHook : IDisposable
+{
+    private const int WH_KEYBOARD_LL = 13;
+    private const int WM_KEYDOWN     = 0x0100;
+    private const int WM_KEYUP       = 0x0101;
+    private const int WM_SYSKEYDOWN  = 0x0104;
+    private const int WM_SYSKEYUP    = 0x0105;
+
+    private LowLevelKeyboardProc _proc;
+    private IntPtr _hookID = IntPtr.Zero;
+
+    public event Action<string, bool> KeyStateChanged;
+
+    public AdvancedKeyHook()
+    {
+        _proc = HookCallback;
+        _hookID = SetHook(_proc);
+    }
+
+    public void Dispose()
+    {
+        UnhookWindowsHookEx(_hookID);
+    }
+
+    private IntPtr SetHook(LowLevelKeyboardProc proc)
+    {
+        using (Process curProcess = Process.GetCurrentProcess())
+        using (ProcessModule curModule = curProcess.MainModule)
+        {
+            return SetWindowsHookEx(WH_KEYBOARD_LL, proc,
+                GetModuleHandle(curModule.ModuleName), 0);
+        }
+    }
+
+    private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+    private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0)
+        {
+            int vkCode = Marshal.ReadInt32(lParam);
+            Keys key = (Keys)vkCode;
+            string keyName = GetFriendlyName(key);
+
+            bool isDown = (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)WM_SYSKEYDOWN);
+
+            if (isDown || wParam == (IntPtr)WM_KEYUP || wParam == (IntPtr)WM_SYSKEYUP)
+            {
+                if (KeyStateChanged != null) KeyStateChanged.Invoke(keyName, isDown);
+            }
+        }
+        return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+    }
+
+    private string GetFriendlyName(Keys key)
+    {
+        switch (key)
+        {
+            case Keys.Space: return "Space";
+            case Keys.Enter: return "Enter";
+            case Keys.Back:  return "Back";
+            case Keys.Tab:   return "Tab";
+            case Keys.Escape: return "Esc";
+            case Keys.Delete: return "Del";
+            case Keys.LShiftKey: case Keys.RShiftKey: return "Shift";
+            case Keys.LControlKey: case Keys.RControlKey: return "Ctrl";
+            case Keys.LMenu: case Keys.RMenu: return "Alt";
+            case Keys.LWin: case Keys.RWin: return "Win";
+            case Keys.Up: return "Up";
+            case Keys.Down: return "Down";
+            case Keys.Left: return "Left";
+            case Keys.Right: return "Right";
+            default: return key.ToString();
+        }
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern IntPtr GetModuleHandle(string lpModuleName);
+}
+'@ -ErrorAction SilentlyContinue
+
+# ─────────────────────────────────────────────────────────────
+#   Variables & State
+# ─────────────────────────────────────────────────────────────
+$heldKeys = New-Object 'System.Collections.Generic.HashSet[string]'
+$script:knownDrives = @{}
+$script:driveLog = ""
+$script:lastWindowTitle = ""
+
+# ─────────────────────────────────────────────────────────────
+#   Helper Functions
+# ─────────────────────────────────────────────────────────────
+function Update-KeyDisplay {
+    if ($heldKeys.Count -eq 0) {
+        $KeyText.Text = ""
+    } else {
+        $sorted = $heldKeys | Sort-Object { 
+            if ($_ -in @("Shift","Ctrl","Alt","Win")) { 0 } else { 1 }
+        }, { $_ }
+        $KeyText.Text = ($sorted -join " + ")
+    }
+}
+
+function Add-DriveLog {
+    param([string]$message)
+    $timestamp = Get-Date -Format "HH:mm:ss"
+    $script:driveLog = "[$timestamp] $message`n" + $script:driveLog
+    # Keep only last 10 lines
+    $lines = $script:driveLog -split "`n" | Select-Object -First 10
+    $script:driveLog = $lines -join "`n"
+    $DriveLogText.Text = $script:driveLog
+}
+
+function Check-Drives {
+    $currentDrives = Get-WmiObject -Class Win32_LogicalDisk -ErrorAction SilentlyContinue | Where-Object { $_.DriveType -in @(2, 3, 4, 5) }
+    
+    foreach ($drive in $currentDrives) {
+        $driveLetter = $drive.DeviceID
+        if (-not $script:knownDrives.ContainsKey($driveLetter)) {
+            $driveType = switch ($drive.DriveType) {
+                2 { "USB" }
+                3 { "HDD" }
+                4 { "NET" }
+                5 { "DVD" }
+                default { "???" }
+            }
+            $label = if ($drive.VolumeName) { $drive.VolumeName } else { "-" }
+            Add-DriveLog "$driveLetter [$driveType] $label CONNECTED"
+            $script:knownDrives[$driveLetter] = $true
+        }
+    }
+    
+    # Check for removed drives
+    $currentLetters = $currentDrives | ForEach-Object { $_.DeviceID }
+    $removedDrives = @($script:knownDrives.Keys) | Where-Object { $_ -notin $currentLetters }
+    foreach ($removed in $removedDrives) {
+        Add-DriveLog "$removed DISCONNECTED"
+        $script:knownDrives.Remove($removed)
+    }
+}
+
+# Arrow direction mapping
+$arrowMap = @{
+    0                = "→"
+    ([Math]::PI/4)   = "↗"
+    ([Math]::PI/2)   = "↑"
+    (3*[Math]::PI/4) = "↖"
+    [Math]::PI       = "←"
+    (-3*[Math]::PI/4)= "↙"
+    (-[Math]::PI/2)  = "↓"
+    (-[Math]::PI/4)  = "↘"
+}
+
+function Get-Direction($dx, $dy) {
+    if ([Math]::Abs($dx) -lt 5 -and [Math]::Abs($dy) -lt 5) { return $null }
+    $angle = [Math]::Atan2(-$dy, $dx)
+    $angle = ($angle + 2*[Math]::PI) % (2*[Math]::PI)
+    $bestDiff = [double]::MaxValue
+    $bestKey = 0
+    foreach ($key in $arrowMap.Keys) {
+        $diff = [Math]::Min([Math]::Abs($angle - $key), [Math]::Abs($angle - $key - 2*[Math]::PI))
+        if ($diff -lt $bestDiff) { $bestDiff = $diff; $bestKey = $key }
+    }
+    if ($bestDiff -gt [Math]::PI/6) { return $null }
+    return $arrowMap[$bestKey]
+}
+
+# ─────────────────────────────────────────────────────────────
+#   Timers
+# ─────────────────────────────────────────────────────────────
+
+# Mouse direction clear timer
+$mouseDirClearTimer = New-Object System.Windows.Threading.DispatcherTimer
+$mouseDirClearTimer.Interval = [TimeSpan]::FromSeconds($DisplayTime)
+$mouseDirClearTimer.Add_Tick({ $MouseDirText.Text = ""; $mouseDirClearTimer.Stop() })
+
+# Mouse poll timer
+$lastPos = [System.Windows.Forms.Cursor]::Position
+
+$mousePollTimer = New-Object System.Windows.Threading.DispatcherTimer
+$mousePollTimer.Interval = [TimeSpan]::FromMilliseconds($PollIntervalMs)
+$mousePollTimer.Add_Tick({
+    $pos = [System.Windows.Forms.Cursor]::Position
+    $buttons = [System.Windows.Forms.Control]::MouseButtons
+
+    $dx = $pos.X - $lastPos.X
+    $dy = $pos.Y - $lastPos.Y
+
+    # Handle mouse direction separately
+    $dir = Get-Direction $dx $dy
+    if ($dir) {
+        $MouseDirText.Text = $dir
+        $mouseDirClearTimer.Stop()
+        $mouseDirClearTimer.Start()
+    }
+
+    # Handle mouse buttons separately (including side buttons)
+    $buttonParts = @()
+    if ($buttons -band [System.Windows.Forms.MouseButtons]::Left)    { $buttonParts += "LMB" }
+    if ($buttons -band [System.Windows.Forms.MouseButtons]::Right)   { $buttonParts += "RMB" }
+    if ($buttons -band [System.Windows.Forms.MouseButtons]::Middle)  { $buttonParts += "MMB" }
+    if ($buttons -band [System.Windows.Forms.MouseButtons]::XButton1) { $buttonParts += "MB4" }
+    if ($buttons -band [System.Windows.Forms.MouseButtons]::XButton2) { $buttonParts += "MB5" }
+
+    # Update button display - show with + like keys, clear instantly when released
+    if ($buttonParts.Count -gt 0) {
+        $MouseButtonText.Text = $buttonParts -join " + "
+    } else {
+        $MouseButtonText.Text = ""
+    }
+
+    $script:lastPos = $pos
+})
+
+# Window title timer
+$windowTitleTimer = New-Object System.Windows.Threading.DispatcherTimer
+$windowTitleTimer.Interval = [TimeSpan]::FromMilliseconds(100)
+$windowTitleTimer.Add_Tick({
     try {
         $title = Get-ForegroundWindowTitle
-        if ($title -and $title -ne $lastTitle) {
-            $lastTitle = $title
-            $label.Text = $title
+        if ($title -and $title -ne $script:lastWindowTitle) {
+            $script:lastWindowTitle = $title
+            $WindowTitleText.Text = $title
         }
     } catch {}
 })
 
-$timer.Start()
-[void]$form.ShowDialog()
+# Drive check timer
+$driveCheckTimer = New-Object System.Windows.Threading.DispatcherTimer
+$driveCheckTimer.Interval = [TimeSpan]::FromMilliseconds($DriveCheckMs)
+$driveCheckTimer.Add_Tick({ Check-Drives })
+
+# ─────────────────────────────────────────────────────────────
+#   Initialize
+# ─────────────────────────────────────────────────────────────
+
+# Initial drive scan
+$initialDrives = Get-WmiObject -Class Win32_LogicalDisk -ErrorAction SilentlyContinue | Where-Object { $_.DriveType -in @(2, 3, 4, 5) }
+foreach ($drive in $initialDrives) {
+    $driveLetter = $drive.DeviceID
+    $driveType = switch ($drive.DriveType) {
+        2 { "USB" }
+        3 { "HDD" }
+        4 { "NET" }
+        5 { "DVD" }
+        default { "???" }
+    }
+    $label = if ($drive.VolumeName) { $drive.VolumeName } else { "-" }
+    $sizeGB = if ($drive.Size) { [math]::Round($drive.Size / 1GB, 0) } else { 0 }
+    Add-DriveLog "$driveLetter [$driveType] $label ${sizeGB}GB"
+    $script:knownDrives[$driveLetter] = $true
+}
+
+# Setup keyboard hook
+$hook = New-Object AdvancedKeyHook
+$hook.add_KeyStateChanged({
+    param($keyName, $isDown)
+    $Window.Dispatcher.Invoke([action]{
+        if ($isDown) {
+            [void]$heldKeys.Add($keyName)
+        } else {
+            [void]$heldKeys.Remove($keyName)
+        }
+        Update-KeyDisplay
+    })
+})
+
+# Show window and start timers
+$Window.Show()
+$mousePollTimer.Start()
+$windowTitleTimer.Start()
+$driveCheckTimer.Start()
+
+Write-Host "Combined Monitor running. Drag window by top bar. Close window or Ctrl+C to exit."
+
+try {
+    [System.Windows.Threading.Dispatcher]::Run()
+}
+finally {
+    $hook.Dispose()
+    $mousePollTimer.Stop()
+    $mouseDirClearTimer.Stop()
+    $windowTitleTimer.Stop()
+    $driveCheckTimer.Stop()
+    $Window.Close()
+}
