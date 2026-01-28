@@ -27,16 +27,20 @@ $DriveCheckMs     = 3000
 $signature = @"
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 
 public class Win32Monitor {
     [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
 
     [DllImport("user32.dll")]
-    public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int count);
+    public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
 
     [DllImport("user32.dll")]
     public static extern int GetWindowTextLength(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 }
 "@
 Add-Type -TypeDefinition $signature -ErrorAction SilentlyContinue
@@ -176,6 +180,15 @@ $WindowTitleText.FontFamily    = 'Consolas'
 $WindowTitleText.TextTrimming  = 'CharacterEllipsis'
 $WindowTitleText.Text          = "Waiting..."
 $WinStack.Children.Add($WindowTitleText)
+
+# Process name display
+$ProcessInfoText = New-Object Windows.Controls.TextBlock
+$ProcessInfoText.FontSize      = 9
+$ProcessInfoText.Foreground    = [Windows.Media.Brushes]::Gray
+$ProcessInfoText.FontFamily    = 'Consolas'
+$ProcessInfoText.TextTrimming  = 'CharacterEllipsis'
+$ProcessInfoText.Text          = ""
+$WinStack.Children.Add($ProcessInfoText)
 
 $WinSection.Child = $WinStack
 $MainStack.Children.Add($WinSection)
@@ -452,15 +465,36 @@ $mousePollTimer.Add_Tick({
     $script:lastPos = $pos
 })
 
-# Window title timer
+# Window title timer with process info
 $windowTitleTimer = New-Object System.Windows.Threading.DispatcherTimer
 $windowTitleTimer.Interval = [TimeSpan]::FromMilliseconds(100)
 $windowTitleTimer.Add_Tick({
     try {
-        $title = Get-ForegroundWindowTitle
-        if ($title -and $title -ne $script:lastWindowTitle) {
-            $script:lastWindowTitle = $title
-            $WindowTitleText.Text = $title
+        $hwnd = [Win32Monitor]::GetForegroundWindow()
+        if ($hwnd -ne [IntPtr]::Zero) {
+            $length = [Win32Monitor]::GetWindowTextLength($hwnd)
+            $builder = New-Object System.Text.StringBuilder ($length + 1)
+            [Win32Monitor]::GetWindowText($hwnd, $builder, $builder.Capacity) | Out-Null
+            $title = $builder.ToString()
+            
+            # Get process info
+            $processId = [uint32]0
+            [Win32Monitor]::GetWindowThreadProcessId($hwnd, [ref]$processId) | Out-Null
+            $proc = Get-Process -Id $processId -ErrorAction SilentlyContinue
+            
+            if ($title -ne $script:lastWindowTitle) {
+                $script:lastWindowTitle = $title
+                $WindowTitleText.Text = if ($title) { $title } else { "(No title)" }
+                
+                if ($proc) {
+                    $procPath = ""
+                    try { $procPath = $proc.Path } catch {}
+                    $ext = if ($procPath) { [System.IO.Path]::GetExtension($procPath) } else { "" }
+                    $ProcessInfoText.Text = "$($proc.ProcessName)$ext (PID:$processId)"
+                } else {
+                    $ProcessInfoText.Text = "PID:$processId"
+                }
+            }
         }
     } catch {}
 })
